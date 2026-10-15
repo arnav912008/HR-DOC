@@ -75,5 +75,4 @@ password change screen, and stored text is escaped before display so one user's 
 - The MFA secret is stored in `auth.db` unencrypted and protected by file permissions.
 - Lost authenticator device: `python manage.py reset-mfa E001`.
 - Dates like "14 Oct" with no year mean the next time that date comes round (up to 7 days in the past counts as backdating). The confirmation always shows the full dates before anything is saved.
-# HR-DOC
-the one stop shop for all the HR needs. 
+
