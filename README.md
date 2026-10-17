@@ -1,6 +1,8 @@
 # HR Policy Assistant
 
-
+[![tests](https://github.com/<your-username>/hr-policy-assistant/actions/workflows/tests.yml/badge.svg)](https://github.com/<your-username>/hr-policy-assistant/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 A private, self-hosted HR chatbot. It answers policy questions from your own `Policy.pdf` **and** looks up and updates
 employee records through chat: who is on leave, when they are back, apply for and approve leave, update your details.

@@ -6,6 +6,7 @@ taken from fixed whitelists, never from user input.
 """
 from __future__ import annotations
 
+import os
 import random
 import re
 import secrets
@@ -18,7 +19,23 @@ import hr_security as sec
 from hr_security import audit
 
 LEAVE_TYPES = ("annual", "sick", "casual", "unpaid")
-DEFAULT_ALLOTMENT = {"annual": 18.0, "sick": 10.0, "casual": 6.0}
+def _load_default_allotment() -> dict:
+    """Yearly leave days per type. Override with HR_DEFAULT_ALLOTMENT="annual=24,sick=12,casual=8"."""
+    base = {"annual": 18.0, "sick": 10.0, "casual": 6.0}
+    for part in os.environ.get("HR_DEFAULT_ALLOTMENT", "").split(","):
+        key, _, val = part.partition("=")
+        key = key.strip().lower()
+        if key in base:
+            try:
+                days = float(val)
+            except ValueError:
+                continue
+            if 0 <= days <= 366:
+                base[key] = days
+    return base
+
+
+DEFAULT_ALLOTMENT = _load_default_allotment()
 MAX_LEAVE_CALENDAR_DAYS = 60
 BACKDATE_LIMIT_DAYS = 7
 MAX_FUTURE_DAYS = 366
@@ -51,7 +68,7 @@ _TEXT_LIMITS = {
 }
 _RE_PHONE = re.compile(r"^\+?[0-9][0-9 ()\-.]{5,19}$")
 _RE_EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,190}\.[A-Za-z]{2,}$")
-_RE_BAND = re.compile(r"^B[1-9]$")
+_RE_BAND = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,11}$")
 _BAD_CHARS = re.compile(r"[<>`\[\]{}\\|]")
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -103,6 +120,10 @@ def init_hr_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_leave_emp ON leave_requests(employee_id, status, end_date);
             CREATE TABLE IF NOT EXISTS holidays (date TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                employee_id TEXT PRIMARY KEY,
+                theme TEXT NOT NULL DEFAULT 'light' CHECK(theme IN ('light','dark'))
+            );
             """
         )
         conn.commit()
@@ -130,7 +151,7 @@ def validate_field(field: str, value: str):
         return (v.lower(), None) if _RE_EMAIL.match(v) else (None, "That doesn't look like a valid email address.")
     if field == "salary_band":
         v = str(value or "").strip().upper()
-        return (v, None) if _RE_BAND.match(v) else (None, "Salary band must look like B1 to B9.")
+        return (v, None) if _RE_BAND.match(v) else (None, "Salary band can use up to 12 letters, digits, dots or dashes (for example B3).")
     if field == "status":
         v = str(value or "").strip().lower()
         v = {"inactive": "terminated"}.get(v, v)
@@ -205,6 +226,13 @@ def get_person(employee_id: str) -> Optional[dict]:
     with hr_conn() as conn:
         r = conn.execute(_PERSON_SQL + " WHERE a.employee_id = ?", (employee_id,)).fetchone()
     return _row_to_person(r) if r else None
+
+
+def all_people() -> list:
+    """Every employee with full profile fields. Used by the bulk importer; not exposed to chat."""
+    with hr_conn() as conn:
+        rows = conn.execute(_PERSON_SQL + " ORDER BY a.employee_id").fetchall()
+    return [_row_to_person(r) for r in rows]
 
 
 def list_people(include_inactive: bool = False) -> list:
@@ -469,21 +497,74 @@ def my_requests(actor_id: str, limit: int = 8) -> list:
 
 
 def pending_for_approval(actor_id: str) -> list:
+    """Requests this person may decide, oldest start first. Each carries context for the decision:
+    the requester's department, what is left of that leave type once this request is granted, and
+    which department colleagues are already away on those dates."""
     actor = _actor(actor_id)
     if not actor or actor["role"] not in ("hr_admin", "manager"):
         return []
+    base = ("SELECT l.id, l.employee_id, l.leave_type, l.start_date, l.end_date, l.days, l.reason, l.status, a.name "
+            "FROM leave_requests l JOIN auth.employees a ON a.employee_id=l.employee_id WHERE l.status='pending' AND ")
+    out = []
     with hr_conn() as conn:
         if actor["role"] == "hr_admin":
-            rows = conn.execute(
-                "SELECT l.id, l.employee_id, l.leave_type, l.start_date, l.end_date, l.days, l.reason, l.status, a.name "
-                "FROM leave_requests l JOIN auth.employees a ON a.employee_id=l.employee_id "
-                "WHERE l.status='pending' AND l.employee_id != ? ORDER BY l.start_date LIMIT 50", (actor_id,)).fetchall()
+            rows = conn.execute(base + "l.employee_id != ? ORDER BY l.start_date LIMIT 50", (actor_id,)).fetchall()
         else:
-            rows = conn.execute(
-                "SELECT l.id, l.employee_id, l.leave_type, l.start_date, l.end_date, l.days, l.reason, l.status, a.name "
-                "FROM leave_requests l JOIN auth.employees a ON a.employee_id=l.employee_id "
-                "WHERE l.status='pending' AND a.manager_id=? ORDER BY l.start_date LIMIT 50", (actor_id,)).fetchall()
-    return [{**_row_request(r[:8]), "name": r[8]} for r in rows]
+            rows = conn.execute(base + "a.manager_id=? ORDER BY l.start_date LIMIT 50", (actor_id,)).fetchall()
+        for r in rows:
+            req = {**_row_request(r[:8]), "name": r[8], "department": None, "remaining": None, "also_away": []}
+            d = conn.execute("SELECT department FROM employee_profile WHERE employee_id=?", (req["employee_id"],)).fetchone()
+            req["department"] = d[0] if d else None
+            if req["leave_type"] != "unpaid":
+                year = req["start"].year
+                used = _sum_days(conn, req["employee_id"], req["leave_type"], year, "approved")
+                held = _sum_days(conn, req["employee_id"], req["leave_type"], year, "pending")
+                req["remaining"] = _allotment(conn, req["employee_id"], year, req["leave_type"]) - used - held
+            if req["department"]:
+                req["also_away"] = [n[0] for n in conn.execute(
+                    "SELECT DISTINCT a.name FROM leave_requests l JOIN auth.employees a ON a.employee_id=l.employee_id "
+                    "JOIN employee_profile p ON p.employee_id=l.employee_id WHERE l.status='approved' AND a.active=1 "
+                    "AND p.department=? AND l.employee_id != ? AND l.start_date <= ? AND l.end_date >= ? ORDER BY a.name LIMIT 5",
+                    (req["department"], req["employee_id"], req["end"].isoformat(), req["start"].isoformat()))]
+            out.append(req)
+    return out
+
+
+def leave_days_by_month(employee_id: str, year: Optional[int] = None) -> list:
+    """Approved working days of leave in each month of `year` (12 numbers)."""
+    year = year or today().year
+    out = [0.0] * 12
+    with hr_conn() as conn:
+        hol = _holidays(conn)
+        rows = conn.execute(
+            "SELECT start_date, end_date FROM leave_requests WHERE employee_id=? AND status='approved' "
+            "AND start_date <= ? AND end_date >= ?", (employee_id, f"{year}-12-31", f"{year}-01-01")).fetchall()
+    for s_, e_ in rows:
+        d, end = max(_d(s_), date(year, 1, 1)), min(_d(e_), date(year, 12, 31))
+        while d <= end:
+            if is_working_day(d, hol):
+                out[d.month - 1] += 1
+            d += timedelta(days=1)
+    return out
+
+
+THEMES = ("light", "dark")
+
+
+def get_theme(employee_id: str) -> str:
+    with hr_conn() as conn:
+        r = conn.execute("SELECT theme FROM user_prefs WHERE employee_id=?", (employee_id,)).fetchone()
+    return r[0] if r and r[0] in THEMES else "light"
+
+
+def set_theme(employee_id: str, theme: str) -> bool:
+    if theme not in THEMES or not sec.get_user(employee_id):
+        return False
+    with hr_conn() as conn:
+        with conn:
+            conn.execute("INSERT INTO user_prefs (employee_id, theme) VALUES (?,?) "
+                         "ON CONFLICT(employee_id) DO UPDATE SET theme=excluded.theme", (employee_id, theme))
+    return True
 
 
 # --------------------------------------------------------------------------- profile updates
@@ -666,19 +747,25 @@ def seed_synthetic_data() -> list:
     return creds
 
 
-def bootstrap() -> list:
-    """Idempotent start-up. Creates schemas, migrates old installs, seeds demo data on an empty HR database."""
+def bootstrap(seed_demo: Optional[bool] = None) -> list:
+    """Idempotent start-up. Creates schemas, migrates old installs, and seeds demo data on an empty HR database.
+
+    Demo seeding is on by default so the project works out of the box. For a real company set
+    HR_SEED_DEMO=0 (the importer in manage.py never seeds demo data).
+    """
+    if seed_demo is None:
+        seed_demo = os.environ.get("HR_SEED_DEMO", "1") != "0"
     sec.secure_runtime()
     rotated = sec.init_auth_db()
     init_hr_db()
     new_creds = []
     with hr_conn() as conn:
         empty = conn.execute("SELECT COUNT(*) FROM employee_profile").fetchone()[0] == 0
-    if empty:
+    if empty and seed_demo:
         new_creds = seed_synthetic_data()
         if new_creds:
             sec.write_credentials(new_creds, note="Synthetic demo accounts.")
-    else:  # an older install: make sure every login has a profile row
+    elif not empty:  # an older install: make sure every login has a profile row
         with hr_conn() as conn:
             with conn:
                 conn.execute("INSERT OR IGNORE INTO employee_profile (employee_id) SELECT employee_id FROM auth.employees")
